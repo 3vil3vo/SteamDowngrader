@@ -1,0 +1,432 @@
+name: Steam Suite Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Steam client channel
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - beta
+      commit:
+        description: SteamTracking commit (blank uses live CDN)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: steam-release-${{ inputs.channel }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.15"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+
+      - name: Build release
+        id: build
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          python - --channel "$CHANNEL" --commit "$COMMIT" --output dist <<'PYEOF'
+          from __future__ import annotations
+
+          import argparse
+          import hashlib
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from functools import partial
+
+          USER_AGENT = "steam-suite/1.0"
+          CHUNK = 1 << 20
+          TIMEOUT = 120
+          RETRIES = 3
+          WORKERS = 8
+
+          CDN = "https://client-update.fastly.steamstatic.com/"
+          MIRROR = "http://media.steampowered.com/client/"
+          TRACKING = (
+              "https://raw.githubusercontent.com/SteamTracking/SteamTracking/"
+              "{commit}/ClientManifest/{name}"
+          )
+
+          MANIFESTS = {
+              "stable": [
+                  ("steam_client_ubuntu12", "steam_client_ubuntu12", "ubuntu12"),
+                  ("steam_client_win64", "steam_client_win64", "win64"),
+                  ("steam_client_osx", "steam_client_osx", "osx"),
+                  ("steam_client_linuxarm64", "steam_client_linuxarm64", "linuxarm64"),
+                  ("steamdeck_stable", "steam_client_steamdeck_stable_ubuntu12", "steamdeck"),
+              ],
+              "beta": [
+                  ("steam_client_publicbeta_ubuntu12", "steam_client_publicbeta_ubuntu12", "ubuntu12"),
+                  ("steam_client_publicbeta_win64", "steam_client_publicbeta_win64", "win64"),
+                  ("steam_client_publicbeta_osx", "steam_client_publicbeta_osx", "osx"),
+                  ("steam_client_publicbeta_linuxarm64", "steam_client_publicbeta_linuxarm64", "linuxarm64"),
+                  ("steamdeck_publicbeta", "steam_client_steamdeck_publicbeta_ubuntu12", "steamdeck"),
+              ],
+          }
+
+          SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+          TRAILING = re.compile(r"_(\d+)$")
+
+
+          def emit(message: str) -> None:
+              sys.stdout.write(message + "\n")
+              sys.stdout.flush()
+
+
+          def open_url(url: str) -> urllib.request.Request:
+              return urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+
+
+          def fetch(url: str) -> bytes:
+              last = None
+              for attempt in range(RETRIES):
+                  try:
+                      with urllib.request.urlopen(open_url(url), timeout=TIMEOUT) as response:
+                          return response.read()
+                  except urllib.error.HTTPError as exc:
+                      if exc.code == 404:
+                          raise
+                      last = exc
+                  except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                      last = exc
+                  if attempt + 1 < RETRIES:
+                      time.sleep(1 + attempt)
+              raise last if last else RuntimeError("fetch failed")
+
+
+          def parse(text: str):
+              state = [0]
+              length = len(text)
+              escapes = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}
+
+              def skip() -> None:
+                  pos = state[0]
+                  while pos < length and text[pos] in " \t\r\n":
+                      pos += 1
+                  state[0] = pos
+
+              def token():
+                  skip()
+                  pos = state[0]
+                  if pos >= length:
+                      return None
+                  if text[pos] == '"':
+                      pos += 1
+                      buffer = []
+                      while pos < length and text[pos] != '"':
+                          if text[pos] == "\\" and pos + 1 < length:
+                              buffer.append(escapes.get(text[pos + 1], text[pos + 1]))
+                              pos += 2
+                          else:
+                              buffer.append(text[pos])
+                              pos += 1
+                      state[0] = pos + 1
+                      return "".join(buffer)
+                  start = pos
+                  while pos < length and text[pos] not in " \t\r\n{}\"":
+                      pos += 1
+                  state[0] = pos
+                  return text[start:pos]
+
+              def block():
+                  result = {}
+                  while True:
+                      skip()
+                      pos = state[0]
+                      if pos >= length:
+                          return result
+                      if text[pos] == "}":
+                          state[0] = pos + 1
+                          return result
+                      key = token()
+                      if key is None:
+                          return result
+                      skip()
+                      pos = state[0]
+                      if pos < length and text[pos] == "{":
+                          state[0] = pos + 1
+                          result[key] = block()
+                      else:
+                          value = token()
+                          if value is None:
+                              return result
+                          result[key] = value
+
+              return block()
+
+
+          def platform(root):
+              for value in root.values():
+                  if isinstance(value, dict) and "version" in value:
+                      return value
+              return None
+
+
+          def collect(block):
+              items = []
+              for value in block.values():
+                  if not isinstance(value, dict):
+                      continue
+                  name = value.get("file")
+                  if isinstance(name, str) and SAFE.match(name):
+                      try:
+                          size = int(value.get("size", "0") or 0)
+                      except (TypeError, ValueError):
+                          size = 0
+                      sha = value.get("sha2")
+                      items.append((name, size, sha if isinstance(sha, str) else None))
+                  vz = value.get("zipvz")
+                  if isinstance(vz, str) and SAFE.match(vz):
+                      match = TRAILING.search(vz)
+                      size = int(match.group(1)) if match else 0
+                      sha = value.get("sha2vz")
+                      items.append((vz, size, sha if isinstance(sha, str) else None))
+              return items
+
+
+          def digest(path: str):
+              try:
+                  h = hashlib.sha256()
+                  with open(path, "rb") as handle:
+                      for chunk in iter(lambda: handle.read(CHUNK), b""):
+                          h.update(chunk)
+                  return h.hexdigest()
+              except OSError:
+                  return None
+
+
+          def matches(path: str, size: int, sha) -> bool:
+              if not os.path.isfile(path):
+                  return False
+              try:
+                  if size > 0 and os.path.getsize(path) != size:
+                      return False
+              except OSError:
+                  return False
+              return sha is None or digest(path) == sha.lower()
+
+
+          def stream(url: str, dest: str, size: int, sha) -> None:
+              tmp = dest + ".part"
+              h = hashlib.sha256()
+              try:
+                  with urllib.request.urlopen(open_url(url), timeout=TIMEOUT) as response:
+                      with open(tmp, "wb") as handle:
+                          while True:
+                              chunk = response.read(CHUNK)
+                              if not chunk:
+                                  break
+                              handle.write(chunk)
+                              h.update(chunk)
+                  if size > 0 and os.path.getsize(tmp) != size:
+                      raise ValueError("size")
+                  if sha and h.hexdigest() != sha.lower():
+                      raise ValueError("sha256")
+                  os.replace(tmp, dest)
+              except BaseException:
+                  if os.path.exists(tmp):
+                      try:
+                          os.unlink(tmp)
+                      except OSError:
+                          pass
+                  raise
+
+
+          def download(filename: str, dest: str, size: int, sha) -> bool:
+              if matches(dest, size, sha):
+                  return True
+              for base in (CDN, MIRROR):
+                  for attempt in range(RETRIES):
+                      try:
+                          stream(base + filename, dest, size, sha)
+                          return True
+                      except urllib.error.HTTPError as exc:
+                          if exc.code == 404 or attempt + 1 == RETRIES:
+                              break
+                      except Exception:
+                          if attempt + 1 == RETRIES:
+                              break
+                      time.sleep(1 + attempt)
+              return False
+
+
+          def load(entry, commit):
+              tracking_name, cdn_name, _ = entry
+              url = (
+                  TRACKING.format(commit=commit, name=tracking_name)
+                  if commit
+                  else f"{CDN}{cdn_name}?{int(time.time())}"
+              )
+              try:
+                  data = fetch(url)
+              except urllib.error.HTTPError as exc:
+                  if exc.code == 404:
+                      return None
+                  emit(f"{cdn_name} {exc}")
+                  return None
+              except Exception as exc:
+                  emit(f"{cdn_name} {exc}")
+                  return None
+              block = platform(parse(data.decode("utf-8", errors="replace")))
+              if block is None:
+                  emit(f"{cdn_name} no platform block")
+                  return None
+              version = str(block.get("version", "unknown"))
+              return cdn_name, version, data, collect(block)
+
+
+          def main() -> int:
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--channel", required=True, choices=["stable", "beta"])
+              parser.add_argument("--commit", default="")
+              parser.add_argument("--output", required=True)
+              parser.add_argument("--workers", type=int, default=WORKERS)
+              args = parser.parse_args()
+
+              os.makedirs(args.output, exist_ok=True)
+              commit = args.commit.strip() or None
+              entries = MANIFESTS[args.channel]
+
+              emit(f"channel={args.channel} source={commit or 'live'}")
+
+              with ThreadPoolExecutor(max_workers=len(entries)) as pool:
+                  loaded = list(pool.map(partial(load, commit=commit), entries))
+
+              versions = []
+              labels = []
+              queue = []
+              seen = set()
+
+              for entry, payload in zip(entries, loaded):
+                  _, _, label = entry
+                  if payload is None:
+                      continue
+                  cdn_name, version, data, items = payload
+                  versions.append(version)
+                  labels.append(label)
+                  with open(os.path.join(args.output, cdn_name), "wb") as handle:
+                      handle.write(data)
+                  emit(f"{cdn_name} version={version} files={len(items)}")
+                  for filename, size, sha in items:
+                      if filename in seen:
+                          continue
+                      seen.add(filename)
+                      queue.append((filename, size, sha))
+
+              if not versions:
+                  emit("no manifests available")
+                  return 1
+
+              total = len(queue)
+              failures = []
+              completed = 0
+
+              with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                  futures = {
+                      pool.submit(
+                          download, filename, os.path.join(args.output, filename), size, sha
+                      ): filename
+                      for filename, size, sha in queue
+                  }
+                  for future in as_completed(futures):
+                      filename = futures[future]
+                      try:
+                          ok = future.result()
+                      except Exception:
+                          ok = False
+                      if ok:
+                          completed += 1
+                      else:
+                          failures.append(filename)
+
+              emit(f"downloaded {completed}/{total} blobs")
+
+              numeric = [int(value) for value in versions if value.isdigit()]
+              tag = str(max(numeric)) if numeric else versions[0]
+              platforms = ", ".join(labels)
+
+              output_file = os.environ.get("GITHUB_OUTPUT")
+              if output_file:
+                  with open(output_file, "a", encoding="utf-8") as handle:
+                      handle.write(f"version={tag}\n")
+                      handle.write(f"platforms={platforms}\n")
+
+              if failures:
+                  emit(f"failed {len(failures)} blobs")
+                  for filename in failures[:10]:
+                      emit(f"  {filename}")
+                  return 2
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+        shell: bash
+
+      - name: Write release notes
+        env:
+          VERSION: ${{ steps.build.outputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          PLATFORMS: ${{ steps.build.outputs.platforms }}
+        run: |
+          if [ "$CHANNEL" = "beta" ]; then LABEL="Beta"; else LABEL="Stable"; fi
+          cat > release_notes.md <<EOF
+          # Steam Suite v${VERSION}
+
+          This release contains a collection of Steam versions used for downgrading.
+
+          ## Version Metadata
+          - **${LABEL} Client Build:** ${VERSION}
+
+          ## Included Files
+          The following packages are available in this release:
+
+          * **Steam Client:** ${PLATFORMS}
+
+          ## Usage
+          These files are provided as raw assets for programmatic access. Use the following structure to fetch specific files:
+
+          \`https://github.com/3vil3vo/SteamDowngrader/releases/download/${VERSION}/[FILENAME]\`
+          EOF
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.build.outputs.version }}
+        run: |
+          gh release delete "$VERSION" --yes --cleanup-tag >/dev/null 2>&1 || true
+          gh release create "$VERSION" \
+            --title "Steam Suite v$VERSION" \
+            --notes-file release_notes.md
+          find dist -maxdepth 1 -type f -print0 | \
+            xargs -0 -n 50 gh release upload "$VERSION" --clobber
